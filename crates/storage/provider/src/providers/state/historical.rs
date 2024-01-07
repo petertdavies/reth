@@ -4,17 +4,21 @@ use crate::{
 };
 use reth_db::{
     cursor::{DbCursorRO, DbDupCursorRO},
-    models::{storage_sharded_key::StorageShardedKey, ShardedKey},
+    models::{storage_sharded_key::StorageShardedKey, BlockNumberAddress, ShardedKey},
     table::Table,
     tables,
+    tables::models::AccountBeforeTx,
     transaction::DbTx,
     BlockNumberList,
 };
 use reth_interfaces::provider::ProviderResult;
 use reth_primitives::{
-    trie::AccountProof, Account, Address, BlockNumber, Bytecode, StorageKey, StorageValue, B256,
+    revm::compat::into_revm_acc, revm_primitives, trie::AccountProof, Account, Address,
+    BlockNumber, Bytecode, Receipts, StorageEntry, StorageKey, StorageValue, B256, U256,
 };
 use reth_trie::updates::TrieUpdates;
+use revm::db::BundleState;
+use std::collections::hash_map::{Entry, HashMap};
 
 /// State provider for a given block number which takes a tx reference.
 ///
@@ -64,7 +68,7 @@ impl<'b, TX: DbTx> HistoricalStateProviderRef<'b, TX> {
     /// Lookup an account in the AccountHistory table
     pub fn account_history_lookup(&self, address: Address) -> ProviderResult<HistoryInfo> {
         if !self.lowest_available_blocks.is_account_history_available(self.block_number) {
-            return Err(ProviderError::StateAtBlockPruned(self.block_number))
+            return Err(ProviderError::StateAtBlockPruned(self.block_number));
         }
 
         // history key to search IntegerList of block number changesets.
@@ -83,7 +87,7 @@ impl<'b, TX: DbTx> HistoricalStateProviderRef<'b, TX> {
         storage_key: StorageKey,
     ) -> ProviderResult<HistoryInfo> {
         if !self.lowest_available_blocks.is_storage_history_available(self.block_number) {
-            return Err(ProviderError::StateAtBlockPruned(self.block_number))
+            return Err(ProviderError::StateAtBlockPruned(self.block_number));
         }
 
         // history key to search IntegerList of block number changesets.
@@ -150,6 +154,72 @@ impl<'b, TX: DbTx> HistoricalStateProviderRef<'b, TX> {
             Ok(HistoryInfo::NotYetWritten)
         }
     }
+
+    fn get_reversed_bundle_state(&self) -> ProviderResult<BundleState> {
+        let mut builder = BundleState::builder(0..=0);
+
+        let mut accounts: HashMap<Address, (Option<Account>, Option<Account>)> = HashMap::new();
+        let mut plain_account_cursor = self.tx.cursor_read::<tables::PlainAccountState>()?;
+
+        for i in
+            self.tx.cursor_dup_read::<tables::AccountChangeSet>()?.walk(Some(self.block_number))?
+        {
+            let AccountBeforeTx { address, info: account } = i.clone()?.1;
+            if let Entry::Vacant(entry) = accounts.entry(address) {
+                let plain_account = plain_account_cursor.seek_exact(address)?.map(|x| x.1);
+                entry.insert((plain_account, account));
+            }
+        }
+
+        let mut storage: HashMap<Address, revm_primitives::HashMap<U256, (U256, U256)>> =
+            HashMap::new();
+        let mut plain_storage_cursor = self.tx.cursor_dup_read::<tables::PlainStorageState>()?;
+
+        for i in self
+            .tx
+            .cursor_dup_read::<tables::StorageChangeSet>()?
+            .walk(Some(BlockNumberAddress((self.block_number, Address::ZERO))))?
+        {
+            let (BlockNumberAddress((_, address)), StorageEntry { key, value }) = i.clone()?;
+            if let revm_primitives::hash_map::Entry::Vacant(entry) =
+                storage.entry(address).or_default().entry(key.into())
+            {
+                plain_storage_cursor.seek_by_key_subkey(address, key)?;
+                if let Some((_, StorageEntry { value: plain_value, .. })) =
+                    plain_storage_cursor.current()?.filter(|x| x.0 == address && x.1.key == key)
+                {
+                    entry.insert((plain_value, value));
+                } else {
+                    entry.insert((U256::ZERO, value));
+                }
+            }
+        }
+
+        for (address, (plain_account, account)) in accounts.iter() {
+            if let Some(plain_account) = plain_account {
+                builder =
+                    builder.state_original_account_info(*address, into_revm_acc(*plain_account));
+            }
+            if let Some(account) = account {
+                builder = builder.state_present_account_info(*address, into_revm_acc(*account));
+            }
+        }
+
+        for (address, storage) in storage {
+            if !accounts.contains_key(&address) {
+                if let Some(account) =
+                    plain_account_cursor.seek_exact(address)?.map(|x| into_revm_acc(x.1))
+                {
+                    builder = builder
+                        .state_original_account_info(address, account.clone())
+                        .state_present_account_info(address, account);
+                }
+            }
+            builder = builder.state_storage(address, storage);
+        }
+
+        Ok(builder.build())
+    }
 }
 
 impl<'b, TX: DbTx> AccountReader for HistoricalStateProviderRef<'b, TX> {
@@ -199,8 +269,12 @@ impl<'b, TX: DbTx> BlockHashReader for HistoricalStateProviderRef<'b, TX> {
 }
 
 impl<'b, TX: DbTx> StateRootProvider for HistoricalStateProviderRef<'b, TX> {
-    fn state_root(&self, _bundle_state: &BundleStateWithReceipts) -> ProviderResult<B256> {
-        Err(ProviderError::StateRootNotAvailableForHistoricalBlock)
+    fn state_root(&self, bundle_state: &BundleStateWithReceipts) -> ProviderResult<B256> {
+        let mut bundle = self.get_reversed_bundle_state()?;
+        bundle.extend(bundle_state.state().clone());
+        BundleStateWithReceipts::new(bundle, Receipts::new(), 0)
+            .state_root_slow(self.tx)
+            .map_err(|err| ProviderError::Database(err.into()))
     }
 
     fn state_root_with_updates(

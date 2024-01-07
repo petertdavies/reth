@@ -431,14 +431,24 @@ impl<DB: Database, EF: ExecutorFactory> BlockchainTree<DB, EF> {
 
                 (status, chain)
             } else {
+                let block_kind = if parent_header.number == canonical_chain.tip().number - 1 {
+                    BlockKind::SiblingOfCanonicalHead
+                } else {
+                    BlockKind::ForksHistoricalBlock
+                };
                 let chain = AppendableChain::new_canonical_fork(
                     block,
                     &parent_header,
                     canonical_chain.inner(),
                     parent,
                     &self.externals,
+                    block_kind,
                 )?;
-                (BlockStatus::Accepted, chain)
+                if block_validation_kind.is_exhaustive() {
+                    (BlockStatus::Valid, chain)
+                } else {
+                    (BlockStatus::Accepted, chain)
+                }
             }
         };
 
@@ -512,7 +522,7 @@ impl<DB: Database, EF: ExecutorFactory> BlockchainTree<DB, EF> {
 
             self.block_indices_mut().insert_non_fork_block(block_number, block_hash, chain_id);
 
-            if block_kind.extends_canonical_head() && block_validation_kind.is_exhaustive() {
+            if block_kind.can_have_state_root_checked() && block_validation_kind.is_exhaustive() {
                 // if the block can be traced back to the canonical head, we were able to fully
                 // validate it
                 Ok(BlockStatus::Valid)
@@ -520,6 +530,11 @@ impl<DB: Database, EF: ExecutorFactory> BlockchainTree<DB, EF> {
                 Ok(BlockStatus::Accepted)
             }
         } else {
+            let block_kind = if canonical_fork.number == canonical_chain.tip().number - 1 {
+                BlockKind::SiblingOfCanonicalHead
+            } else {
+                BlockKind::ForksHistoricalBlock
+            };
             debug!(target: "blockchain_tree", ?canonical_fork, "Starting new fork from side chain");
             // the block starts a new fork
             let chain = parent_chain.new_chain_fork(
@@ -528,9 +543,14 @@ impl<DB: Database, EF: ExecutorFactory> BlockchainTree<DB, EF> {
                 canonical_chain.inner(),
                 canonical_fork,
                 &self.externals,
+                block_kind,
             )?;
             self.insert_chain(chain);
-            Ok(BlockStatus::Accepted)
+            if block_kind.can_have_state_root_checked() {
+                Ok(BlockStatus::Valid)
+            } else {
+                Ok(BlockStatus::Accepted)
+            }
         };
 
         // After we inserted the block, we try to connect any buffered blocks

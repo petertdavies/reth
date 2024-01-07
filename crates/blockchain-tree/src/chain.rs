@@ -99,12 +99,13 @@ impl AppendableChain {
     }
 
     /// Create a new chain that forks off of the canonical chain.
-    pub fn new_canonical_fork<DB, EF>(
+    pub (crate) fn new_canonical_fork<DB, EF>(
         block: SealedBlockWithSenders,
         parent_header: &SealedHeader,
         canonical_block_hashes: &BTreeMap<BlockNumber, BlockHash>,
         canonical_fork: ForkBlock,
         externals: &TreeExternals<DB, EF>,
+        block_kind: BlockKind,
     ) -> Result<Self, InsertBlockError>
     where
         DB: Database,
@@ -120,11 +121,13 @@ impl AppendableChain {
             canonical_fork,
         };
 
-        let bundle_state = Self::validate_and_execute_sidechain(
+        let (bundle_state, _) = Self::validate_and_execute(
             block.clone(),
             parent_header,
             state_provider,
             externals,
+            block_kind,
+            BlockValidationKind::Exhaustive,
         )
         .map_err(|err| InsertBlockError::new(block.block.clone(), err.into()))?;
 
@@ -141,6 +144,7 @@ impl AppendableChain {
         canonical_block_hashes: &BTreeMap<BlockNumber, BlockHash>,
         canonical_fork: ForkBlock,
         externals: &TreeExternals<DB, EF>,
+        block_kind: BlockKind,
     ) -> Result<Self, InsertBlockError>
     where
         DB: Database,
@@ -166,11 +170,13 @@ impl AppendableChain {
             canonical_block_hashes,
             canonical_fork,
         };
-        let block_state = Self::validate_and_execute_sidechain(
+        let (block_state, _) = Self::validate_and_execute(
             block.clone(),
             parent,
             bundle_state_data,
             externals,
+            block_kind,
+            BlockValidationKind::Exhaustive,
         )
         .map_err(|err| InsertBlockError::new(block.block.clone(), err.into()))?;
         // extending will also optimize few things, mostly related to selfdestruct and wiping of
@@ -238,31 +244,17 @@ impl AppendableChain {
 
             Ok((bundle_state, Some(trie_updates)))
         } else {
+            if block_kind.can_have_state_root_checked() && block_validation_kind.is_exhaustive() {
+                let state_root = provider.state_root(&bundle_state)?;
+                if block.state_root != state_root {
+                    return Err(ConsensusError::BodyStateRootDiff(
+                        GotExpected { got: state_root, expected: block.state_root }.into(),
+                    )
+                    .into())
+                }
+            }
             Ok((bundle_state, None))
         }
-    }
-
-    /// Validate and execute the given sidechain block, skipping state root validation.
-    fn validate_and_execute_sidechain<BSDP, DB, EF>(
-        block: SealedBlockWithSenders,
-        parent_block: &SealedHeader,
-        bundle_state_data_provider: BSDP,
-        externals: &TreeExternals<DB, EF>,
-    ) -> RethResult<BundleStateWithReceipts>
-    where
-        BSDP: BundleStateDataProvider,
-        DB: Database,
-        EF: ExecutorFactory,
-    {
-        let (state, _) = Self::validate_and_execute(
-            block,
-            parent_block,
-            bundle_state_data_provider,
-            externals,
-            BlockKind::ForksHistoricalBlock,
-            BlockValidationKind::SkipStateRootValidation,
-        )?;
-        Ok(state)
     }
 
     /// Validate and execute the given block, and append it to this chain.
@@ -327,6 +319,8 @@ pub(crate) enum BlockKind {
     ///
     ///    [`head..(block.parent)*,block`]
     ExtendsCanonicalHead,
+    ///
+    SiblingOfCanonicalHead,
     /// The block can be traced back to an ancestor of the canonical head: a historical block, but
     /// this chain does __not__ include the canonical head.
     ForksHistoricalBlock,
@@ -337,5 +331,10 @@ impl BlockKind {
     #[inline]
     pub(crate) fn extends_canonical_head(&self) -> bool {
         matches!(self, BlockKind::ExtendsCanonicalHead)
+    }
+
+    /// Returns `true` if the block
+    pub(crate) fn can_have_state_root_checked(&self) -> bool {
+        matches!(self, BlockKind::ExtendsCanonicalHead | BlockKind::SiblingOfCanonicalHead)
     }
 }
